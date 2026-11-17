@@ -1,5 +1,3 @@
-# PaymentTransactions
-
 # Payments Platform — техническое задание (v0.1)
 
 > Учебный, но приближённый к продакшену платёжный сервис: идемпотентные операции, асинхронная обработка через worker, transactional outbox, retry/backoff и полноценная история webhook-доставки.
@@ -13,10 +11,10 @@
 | | |
 |---|---|
 | **Что** | Платёжный сервис для мерчантов: создание платежа, асинхронная обработка через mock-PSP, доставка webhook-событий с ретраями и историей |
-| **Из чего** | `payments-api`, `processing-worker`, `webhook-service` (+ опционально `query-api`) |
-| **Инфраструктура** | PostgreSQL, Redis, Redpanda (Kafka API), OTel Collector, Prometheus, Grafana, Tempo, Loki |
+| **Из чего** | `payments-api`, `processing-worker`, `webhooks-api` (+ опционально `query-api`) |
+| **Инфраструктура** | PostgreSQL, Redis, RabbitMQ, OTel Collector, Prometheus, Grafana, Tempo, Loki |
 | **Ключевые паттерны** | Idempotency-Key, transactional outbox, consumer inbox (dedupe), retry/backoff + jitter, DLQ, CQRS-lite |
-| **Стек (базовый)** | Go 1.23+, chi, pgx, goose, franz-go, go-redis, OpenTelemetry |
+| **Стек (базовый)** | .NET / ASP.NET Core, EF Core + Npgsql, RabbitMQ.Client, StackExchange.Redis, OpenTelemetry |
 | **Формат запуска** | Docker Compose, один репозиторий (monorepo) |
 
 ---
@@ -40,7 +38,7 @@
 - Refund / partial refund / chargeback — вынесено в v2 (но модель данных к ним готова).
 - Мультивалютные конвертации и курсы.
 - Kubernetes, service mesh, мультирегион — сознательно за бортом, чтобы не утонуть.
-- UI: максимум — Swagger UI, Redpanda Console и Grafana.
+- UI: максимум — Swagger UI, RabbitMQ Management UI и Grafana.
 
 ---
 
@@ -53,7 +51,7 @@
 | «платёжный сервис» | `payments-api` + `processing-worker`, домен `payments` |
 | «идемпотентные операции» | `Idempotency-Key` + таблица `idempotency_keys` + fast-path в Redis + PSP idempotency key |
 | «processing worker» | отдельный consumer-сервис, state machine, вызов PSP, обработка таймаутов |
-| «outbox-паттерн» | `outbox` таблица в одной транзакции с бизнес-изменением + relay → Redpanda |
+| «outbox-паттерн» | `outbox` таблица в одной транзакции с бизнес-изменением + relay → RabbitMQ |
 | «retry/backoff» | классификация ошибок PSP, exponential backoff + jitter, `next_attempt_at`, DLQ |
 | «история webhook-доставки» | `webhook_deliveries` + `webhook_attempts`, API истории, replay, подпись HMAC |
 
@@ -144,7 +142,7 @@
 | durability | событие не теряется при падении сервиса между коммитом и публикацией |
 | durably | retry-состояние переживает рестарт (не в памяти) |
 | consistency | API и worker — strongly consistent в своей БД; read-модель — eventual |
-| ordering | порядок событий гарантирован в рамках одного `payment_id` |
+| ordering | at-least-once; строгий порядок не гарантируется, события несут `version` и `occurred_at` |
 | security | API-ключи, HMAC, отсутствие карточных данных, секреты вне git |
 | observability | каждый платёж прослеживается от HTTP до webhook по `trace_id` / `payment_id` |
 | эксплуатация | один `docker compose up` поднимает весь стенд |
@@ -164,10 +162,10 @@ flowchart LR
     hook["Webhook-эндпоинт<br/>мерчанта"]
 
     subgraph platform["Payments Platform"]
-        api["Payments API"]
-        worker["Processing Worker"]
-        wh["Webhook Service"]
-        q["Query API<br/>(этап 3)"]
+        api["payments-api"]
+        worker["processing-worker"]
+        wh["webhooks-api"]
+        q["query-api<br/>(этап 4)"]
     end
 
     customer -->|"инициирует оплату"| merchant
@@ -204,25 +202,25 @@ flowchart TB
         end
 
         subgraph whdomain["Домен webhooks"]
-            whs["webhook-service"]
+            whs["webhooks-api"]
             wdb[("PostgreSQL<br/>webhooks")]
             whs --> wdb
         end
 
-        subgraph readdomain["Домен read (этап 3)"]
+        subgraph readdomain["Домен read (этап 4)"]
             qry["query-api"]
             qdb[("PostgreSQL<br/>projections")]
             qry --> qdb
         end
 
         redis[("Redis<br/>idempotency cache, rate limit")]
-        rp[("Redpanda<br/>Kafka API")]
+        mq[("RabbitMQ<br/>exchanges + queues")]
 
         api --> redis
-        api -->|"outbox relay"| rp
-        worker -->|"consume / outbox relay"| rp
-        whs -->|"consume"| rp
-        qry -->|"consume"| rp
+        api -->|"publish via outbox relay"| mq
+        worker -->|"consume / publish"| mq
+        whs -->|"consume"| mq
+        qry -->|"consume"| mq
     end
 
     client --> gw
@@ -241,8 +239,8 @@ flowchart TB
 |---|---|---|---|
 | `payments-api` | приём платежей, идемпотентность, state machine, outbox | `payments`, `idempotency_keys`, `outbox`, `payment_events` | не вызывает PSP синхронно |
 | `processing-worker` | consumer команд, вызов PSP, ретраи, финализация статуса | та же БД `payments` (осознанно) | не принимает внешний HTTP-трафик |
-| `webhook-service` | подписки, доставка, подпись, история, replay | `webhook_subscriptions`, `webhook_deliveries`, `webhook_attempts`, свой `inbox`/`outbox` | не знает, как создаётся платёж |
-| `query-api` (этап 3) | read-модель для истории и таймлайна | `projections` | не пишет в доменные БД |
+| `webhooks-api` | подписки, доставка, подпись, история, replay | `webhook_subscriptions`, `webhook_deliveries`, `webhook_attempts`, свой `inbox`/`outbox` | не знает, как создаётся платёж |
+| `query-api` (этап 4) | read-модель для истории и таймлайна | `projections` | не пишет в доменные БД |
 | `mock-psp` | эмуляция провайдера и сбоев | in-memory | не является частью продакшн-контура |
 
 **Правила**
@@ -262,7 +260,7 @@ sequenceDiagram
     participant R as Redis
     participant P as PostgreSQL
     participant O as Outbox Relay
-    participant K as Redpanda
+    participant B as RabbitMQ
 
     C->>A: POST /v1/payments + Idempotency-Key
     A->>A: валидация, SHA-256 канонического body
@@ -287,7 +285,8 @@ sequenceDiagram
         A-->>C: 202 Accepted {payment_id, status: pending}
         A->>P: UPDATE idempotency_keys SET completed + response snapshot
         O->>P: SELECT ... FOR UPDATE SKIP LOCKED
-        O->>K: publish payment.created.v1 (key = payment_id)
+        O->>B: publish payment.created.v1<br/>routing key payment.created, persistent
+        B-->>O: publisher confirm
         O->>P: UPDATE outbox SET published_at = now()
     end
 ```
@@ -297,14 +296,14 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     autonumber
-    participant K as Redpanda
+    participant B as RabbitMQ
     participant W as processing-worker
     participant P as PostgreSQL
     participant S as Mock PSP
-    participant H as webhook-service
+    participant H as webhooks-api
     participant M as Эндпоинт мерчанта
 
-    K->>W: payment.created.v1
+    B->>W: payment.created.v1
     W->>P: inbox check + lock платежа (SKIP LOCKED)
     W->>P: status = processing, version++
     W->>S: POST /authorize (Idempotency-Key = payment_id)
@@ -319,8 +318,8 @@ sequenceDiagram
     else approved
         S-->>W: approved + psp_reference
         W->>P: BEGIN status = succeeded + outbox payment.succeeded.v1 COMMIT
-        W->>K: relay публикует событие
-        K->>H: payment.succeeded.v1
+        W->>B: relay публикует событие (publisher confirm)
+        B->>H: payment.succeeded.v1
         H->>H: подобрать подписки, создать delivery
         H->>M: POST + HMAC-подпись
         alt 2xx
@@ -409,7 +408,7 @@ flowchart LR
     b --> o["INSERT outbox"]
     o --> c["COMMIT"]
     c --> r["relay: SELECT ... FOR UPDATE SKIP LOCKED"]
-    r --> k["publish в Redpanda"]
+    r --> k["publish в RabbitMQ<br/>persistent + confirm"]
     k --> u["UPDATE outbox SET published_at"]
     u --> r
     k -.->|"ошибка"| f["attempts++, next_attempt_at"]
@@ -426,26 +425,28 @@ flowchart LR
 | `event_type`, `event_version` | text / int | `payment.succeeded`, 1 |
 | `payload` | jsonb | тело события |
 | `headers` | jsonb | `traceparent`, `correlation_id` |
+| `status` | text | `pending` / `published` / `failed` |
 | `created_at` | timestamptz | |
 | `published_at` | timestamptz null | null = ещё не опубликовано |
 | `attempts` | int | |
 | `next_attempt_at` | timestamptz | backoff relay'я |
 | `last_error` | text | |
 
-Индекс: `(published_at, next_attempt_at, id) WHERE published_at IS NULL`.
+Индекс: `(next_attempt_at, id) WHERE status = 'pending'`.
 
 ### 8.3. Relay
 
-- Живёт библиотекой внутри сервиса, отдельный goroutine, poll каждые 200–500 ms.
-- Батч 100, `FOR UPDATE SKIP LOCKED` — можно масштабировать горизонтально.
-- Ключ сообщения — `aggregate_id`: гарантирует порядок в рамках платежа.
-- Заголовки: `event_id`, `event_type`, `traceparent` — для дедупликации и сквозного трейса.
-- Ошибка публикации → `attempts++`, `next_attempt_at = now + backoff`, после N попыток → `outbox_dlq` + алерт.
-- Публикация и коммит не атомарны — поэтому at-least-once, а не «ровно один раз».
+- Живёт библиотекой внутри сервиса, отдельный `BackgroundService`, poll каждые 200–500 ms.
+- Батч до 100 событий, `FOR UPDATE SKIP LOCKED` — relay можно масштабировать горизонтально.
+- Публикация: `persistent` + `mandatory=true` + publisher confirm. `published_at` ставим только после `BasicAck` от брокера.
+- `BasicNack`, таймаут confirm или `BasicReturn` (нет очереди под routing key) — это ошибка публикации, а не успех.
+- Заголовки AMQP: `event_id`, `event_type`, `traceparent` — для дедупликации и сквозного трейса.
+- Ошибка → `attempts++`, `next_attempt_at = now + backoff`; после N попыток → `status = failed`, `next_attempt_at = NULL` и алерт.
+- Публикация и коммит БД не атомарны — поэтому at-least-once, а не «ровно один раз».
 
 ### 8.4. Consumer inbox
 
-Каждый consumer в той же транзакции, что и бизнес-изменение, вставляет `(consumer_group, event_id)` в `inbox`. Повторная доставка упирается в PK и игнорируется. Это даёт **effectively-once** обработку при at-least-once доставке.
+Каждый consumer в той же транзакции, что и бизнес-изменение, вставляет `(consumer_name, event_id)` в `inbox` (`consumer_name` — имя сервиса/очереди, у RabbitMQ нет consumer groups). Повторная доставка упирается в PK и игнорируется. Это даёт **effectively-once** обработку при at-least-once доставке.
 
 Альтернатива для взрослого продакшена — Debezium CDC по `outbox`; в учебном проекте poll-relay проще и нагляднее.
 
@@ -455,7 +456,7 @@ flowchart LR
 
 ### 9.1. Почему не sleep в обработчике
 
-Долгие паузы (минуты/часы) нельзя держать в памяти: рестарт пода всё потеряет. Поэтому расписание хранится в БД (`payment_attempts.next_attempt_at`), а worker периодически выбирает созревшие попытки. Альтернативы: delayed-топики в Kafka/Redpanda или Redis sorted set — упомянуть в README, но не тащить в v1.
+Долгие паузы (минуты/часы) нельзя держать в памяти: рестарт пода всё потеряет. Поэтому расписание хранится в БД (`payment_attempts.next_attempt_at`), а worker периодически выбирает созревшие попытки. Альтернативы: delayed-очереди RabbitMQ (TTL + DLX) или Redis sorted set — упомянуть в README, но не тащить в v1.
 
 ### 9.2. Классификация ошибок
 
@@ -478,14 +479,14 @@ flowchart LR
 | 7 | 30 min |
 | 8 | 2 h |
 
-Далее — `failed` с `failure_reason = retries_exhausted`, событие и запись в DLQ-топик `payments.dlq.v1`.
+Далее — `failed` с `failure_reason = retries_exhausted`, событие и запись в очередь `payments.dlq` (через `payments.dlx`).
 
 Jitter: `delay = base * (0.8 + rand*0.4)` — чтобы ретраи не собирались в стаю.
 
 ### 9.4. Защита от двойной обработки
 
-- Партиционирование по `payment_id` → один consumer на платёж в рамках группы.
-- Дополнительно — optimistic lock по `version` и/или `SELECT ... FOR UPDATE SKIP LOCKED` при взятии попытки.
+- Одна команда на платёж: повторная доставка сообщения не означает повторный вызов PSP — сначала inbox-check и проверка статуса.
+- Попытку берём через `SELECT ... FOR UPDATE SKIP LOCKED`, изменение статуса — через optimistic lock по `version`.
 - Проверка «платёж уже в финальном статусе» перед вызовом PSP.
 - Идемпотентный ключ PSP — последняя линия обороны.
 
@@ -552,7 +553,7 @@ flowchart TD
     ok -->|"нет"| cnt{"остались попытки?"}
     cnt -->|"да"| bo["next_attempt_at = now + backoff * jitter"]
     bo --> s
-    cnt -->|"нет"| dlq["exhausted + DLQ + алерт"]
+    cnt -->|"нет"| dlq["exhausted + webhooks.dlq + алерт"]
     dlq --> replay["replay API"]
     replay --> s
 ```
@@ -611,7 +612,7 @@ flowchart TD
 ### 10.5. Гарантии
 
 - Доставка **at-least-once**: мерчант обязан дедуплицировать по `event_id`.
-- Порядок в рамках платежа — по возможности; при ретраях возможен обгон. В payload есть `occurred_at`, а в v2 — `sequence`.
+- Порядок не гарантируется: RabbitMQ не партиционирует по ключу, а ретраи могут обгонять друг друга. В payload есть `occurred_at` и `aggregate_version` — мерчант должен уметь дедуплицировать по `event_id` и игнорировать устаревшие версии.
 - Событие считается доставленным только при 2xx.
 
 ---
@@ -767,6 +768,7 @@ erDiagram
   "event_id": "evt_01J...",
   "event_type": "payment.succeeded",
   "event_version": 1,
+  "aggregate_version": 7,
   "occurred_at": "2026-11-17T14:32:25Z",
   "producer": "processing-worker",
   "aggregate_id": "pay_01J...",
@@ -777,16 +779,22 @@ erDiagram
 }
 ```
 
-Топики:
+Exchanges и очереди:
 
-| Топик | Партиции | Ключ | Кто пишет | Кто читает |
+| Exchange | Тип | Routing key | Очередь | Consumer |
 |---|---|---|---|---|
-| `payments.commands.v1` | 6 | `payment_id` | payments-api (outbox) | processing-worker |
-| `payments.events.v1` | 12 | `payment_id` | payments-api, processing-worker | webhook-service, query-api |
-| `payments.dlq.v1` | 3 | `payment_id` | processing-worker | алертинг, ручной разбор |
-| `webhooks.dlq.v1` | 3 | `delivery_id` | webhook-service | алертинг, ручной разбор |
+| `payments.commands` | direct | `payment.created` | `payments.commands.q` | `processing-worker` |
+| `payments.events` | topic | `payment.*` | `webhooks.payments.q` | `webhooks-api` |
+| `payments.events` | topic | `payment.*` | `query.payments.q` | `query-api` (этап 4) |
+| `payments.dlx` | fanout | — | `payments.dlq` | алертинг, ручной разбор |
+| `webhooks.dlx` | fanout | — | `webhooks.dlq` | алертинг, ручной разбор |
 
-События: `payment.created`, `payment.processing`, `payment.succeeded`, `payment.failed`, `payment.canceled`, `payment.cancel_requested`.
+- Очереди — quorum, durable; сообщения — persistent.
+- `payments.commands.q` и `webhooks.payments.q` смотрят в свой DLX: poison-сообщение после `nack(requeue: false)` уходит в DLQ, а не крутится бесконечно.
+- В `webhooks.dlq` также публикуем `exhausted`-доставки — чтобы операционный разбор шёл из одного места, даже если сама история лежит в БД.
+- Routing key = тип события: `payment.created`, `payment.processing`, `payment.succeeded`, `payment.failed`, `payment.canceled`, `payment.cancel_requested`.
+- RabbitMQ не хранит offset'ы и не даёт «переиграть» историю после ack. Роль журнала играют `payment_events` и `outbox` в БД, а повторная доставка webhook — это replay из `webhook_deliveries`, а не из брокера.
+- Строгий порядок в рамках платежа не гарантируется. Если он понадобится, вариант — consistent-hash exchange по `payment_id`; в v1 сознательно не тащим.
 
 ---
 
@@ -798,7 +806,7 @@ erDiagram
 flowchart LR
     api["payments-api"] --> otel["OTel Collector"]
     worker["processing-worker"] --> otel
-    wh["webhook-service"] --> otel
+    wh["webhooks-api"] --> otel
     q["query-api"] --> otel
 
     otel --> prom["Prometheus<br/>метрики"]
@@ -813,7 +821,7 @@ flowchart LR
 ### 13.2. Трейсы
 
 - OTel SDK во всех сервисах, W3C `traceparent`.
-- Проброс через HTTP-заголовки и через заголовки Kafka-сообщений (из outbox).
+- Проброс через HTTP-заголовки и через AMQP-заголовки сообщений (из outbox).
 - Спаны: HTTP handler → DB query → outbox publish → consumer → PSP call → webhook POST.
 - Атрибуты: `payment_id`, `merchant_id`, `event_id`, `delivery_id`, `attempt`.
 - Один трейс должен позволять пройти путь «создание → PSP → webhook» (с оговоркой на асинхронность: связь через `link`, а не parent, если хочется канонично).
@@ -826,14 +834,17 @@ flowchart LR
 | `payments_created_total{status}` | counter | воронка |
 | `payment_processing_duration_seconds` | histogram | скорость обработки |
 | `payment_attempts_total{outcome}` | counter | retry-активность |
-| `outbox_pending_events` | gauge | неPublished хвост |
+| `outbox_pending_events` | gauge | неопубликованный хвост |
 | `outbox_publish_lag_seconds` | histogram | задержка публикации |
-| `consumer_lag` | gauge | отставание consumer'ов |
+| `queue_depth{queue}` | gauge | готовые к доставке сообщения (аналог lag) |
+| `queue_unacked{queue}` | gauge | сообщения в работе, признак зависшего consumer'а |
 | `webhook_delivery_attempts_total{outcome}` | counter | успех/провал |
 | `webhook_delivery_latency_seconds` | histogram | скорость доставки |
 | `webhook_retries_scheduled_total` | counter | штормы ретраев |
 | `webhook_dlq_size` | gauge | «застрявшие» |
 | `idempotency_cache_hits_total` | counter | эффективность Redis |
+
+Метрики брокера отдаёт штатный плагин `rabbitmq_prometheus` (порт 15692) — отдельный exporter не нужен.
 
 ### 13.4. Логи
 
@@ -845,14 +856,14 @@ JSON, обязательные поля: `ts`, `level`, `service`, `trace_id`, `
 
 1. **Service overview** — RPS, ошибки, p50/p95/p99 по каждому сервису.
 2. **Payment funnel** — created → processing → succeeded/failed, конверсия, причины отказов.
-3. **Outbox & consumers** — pending, lag, DLQ, скорость relay.
+3. **Outbox & consumers** — pending, queue depth, unacked, DLQ, скорость relay.
 4. **Webhook health** — attempts, success rate, latency, retries, exhausted, top failing мерчанты.
-5. **Infra** — Postgres connections/locks, Redis hits/memory, Redpanda lag/disk.
+5. **Infra** — Postgres connections/locks, Redis hits/memory, RabbitMQ queue depth/connections/memory.
 
 ### 13.6. Алерты
 
 - `outbox_publish_lag_seconds > 60` в течение 5 минут.
-- `consumer_lag > 1000` в течение 10 минут.
+- `queue_depth{queue}` > 1000 в течение 10 минут или `queue_unacked` не падает 15 минут.
 - Доля неуспешных webhook-доставок > 20% за 10 минут.
 - `webhook_dlq_size > 0`.
 - p99 создания платежа > 1 s в течение 10 минут.
@@ -876,39 +887,63 @@ JSON, обязательные поля: `ts`, `level`, `service`, `trace_id`, `
 
 ## 15. Технологический стек
 
+Стек зафиксирован под ASP.NET Core. Архитектура от языка не зависит — меняются только адаптеры: HTTP-фреймворк, клиент БД, брокер и фоновые воркеры. Все паттерны из разделов 7–10 остаются теми же.
+
 ### 15.1. Базовый вариант
 
 | Слой | Технология | Почему |
 |---|---|---|
-| Язык | Go 1.23+ | быстрый старт, маленькие образы, отличный OTel/kafka-экосистема |
-| HTTP | chi | минимализм, стандартные middleware |
-| БД | PostgreSQL 16 | транзакции, `SKIP LOCKED`, jsonb, надёжность |
-| Драйвер | pgx/v5 | производительность, нативный pool |
-| Миграции | goose | простые SQL-миграции |
-| Кэш/локи | Redis 7 | идемпотентность, rate limit |
-| Брокер | Redpanda | Kafka API, один бинарник, без ZooKeeper, удобно локально |
-| Kafka-клиент | franz-go | производительный, без CGO |
+| Платформа | .NET 8+ (для проекта — 10 LTS), C# 12/13 | один язык для API, воркеров и тестов; ASP.NET Core — быстрый HTTP-стек |
+| HTTP | ASP.NET Core Minimal APIs + endpoint filters | меньше церемоний, чем контроллеры; фильтр — удобное место для идемпотентности |
+| Валидация | FluentValidation | декларативно и тестируемо |
+| БД | PostgreSQL 16 | транзакции, `SKIP LOCKED`, `jsonb` |
+| Доступ к данным | EF Core 9/10 + Npgsql | миграции и маппинг; сырой SQL — для очередей и `SKIP LOCKED` |
+| Миграции | EF Core Migrations | один инструмент с моделью |
+| Кэш/локи | Redis 7 + StackExchange.Redis | fast-path идемпотентности, rate limit |
+| Брокер | RabbitMQ 4.x | лёгкий, DLX и publisher confirms из коробки, management UI; без партиций и offset'ов |
+| Клиент брокера | RabbitMQ.Client 7.x | официальный асинхронный клиент: publisher confirms, manual ack, prefetch |
+| HTTP-клиенты | `IHttpClientFactory` + Polly v8 | пулы соединений, таймауты, circuit breaker |
+| Фоновая работа | `BackgroundService` + `PeriodicTimer` + `Channel<T>` | штатный хостинг, graceful shutdown, DI-скоупы |
 | Контракты | OpenAPI 3.1 + AsyncAPI + JSON Schema | явные границы |
-| Трейсы | OpenTelemetry + Tempo | стандарт |
+| Трейсы | OpenTelemetry .NET + Tempo | автоинструментация ASP.NET Core, HttpClient, Npgsql |
 | Метрики | Prometheus + Grafana | стандарт |
-| Логи | slog + Loki | структурно и дёшево |
+| Логи | Serilog + Loki (или OTLP-логи) | структурные логи с TraceId/SpanId |
 | E2E/нагрузка | compose + k6 | воспроизводимо |
-| Тесты | testify + testcontainers-go | интеграционные с реальными зависимостями |
+| Тесты | xUnit + FluentAssertions + Testcontainers for .NET + `WebApplicationFactory` | интеграционные с реальными зависимостями |
 
-### 15.2. Альтернативы (если хочется другой стек)
+### 15.2. Альтернативы и что не тащим в v1
 
 | Вместо | Можно взять | Комментарий |
 |---|---|---|
-| Go | Kotlin + Spring Boot 3 | ближе к корпоративному рынку; тяжелее по памяти |
-| Go | Java 21 + virtual threads | хороший вариант для «как в банке» |
-| Go | Python + FastAPI | быстрее писать, слабее типы и конкурентность |
-| Redpanda | Apache Kafka | тот же API, больше движущихся частей |
+| Ручной outbox/inbox | MassTransit | готовые outbox/inbox и саги, но учебная механика спрятана; честный путь — сначала руками, потом сравнить |
+| Ручной outbox/inbox | Wolverine | другой взгляд на консистентность и обработку сообщений |
+| EF Core | Dapper | для outbox-релея и чтения прозрачнее и быстрее |
+| Minimal API | Контроллеры | если ближе классический ASP.NET |
+| RabbitMQ | NATS JetStream | ещё легче: один бинарник ~20 МБ, но другая модель очередей и DLQ нужно строить самому |
+| RabbitMQ | Redis Streams | вообще без нового контейнера, но слабее гарантии доставки и нет DLX |
+| RabbitMQ | Apache Kafka | если понадобятся партиции, replay и большие объёмы |
 | poll-relay | Debezium CDC | «взрослее», но сложнее в отладке |
 | Redis | Valkey | API-совместимый форк |
 | Tempo | Jaeger | привычнее, но тяжелее |
 | Compose | k3s + Helm | следующий шаг после v1, не в первом инкременте |
 
-> Если проект нужен как портфолио под конкретную вакансию — стек стоит выбрать под неё. Архитектура от этого не меняется.
+> MassTransit/Wolverine стоит попробовать **после** ручной реализации: иначе outbox и retry останутся «магией фреймворка», а на собеседовании нужно объяснять механику, а не конфиг.
+
+### 15.3. .NET-специфика, на которой легко обжечься
+
+- **`DbContext` — scoped.** В `BackgroundService` создавай scope на сообщение через `IServiceScopeFactory`: один долгоживущий контекст = гонки и `ObjectDisposedException`.
+- **Не `Task.Run` для фоновой работы.** `BackgroundService` + `CancellationToken` + корректный shutdown, иначе релей будет терять батчи при деплое.
+- **Идемпотентность — через unique constraint.** Лови `DbUpdateException` с `PostgresException.SqlState == "23505"`, а не делай `SELECT` перед `INSERT` (TOCTOU).
+- **`FOR UPDATE SKIP LOCKED` — только сырой SQL.** `FromSqlRaw`/Dapper; LINQ этого не умеет.
+- **Outbox пишется в той же транзакции**, что и бизнес-изменение: `IDbContextTransaction` + один `SaveChangesAsync`.
+- **Время — через `TimeProvider`.** Иначе тесты ретраев превращаются в `Thread.Sleep`.
+- **`jsonb`** — `JsonDocument`/`JsonElement` или value converters; не `string` с ручной сериализацией.
+- **OTel-контекст в AMQP** надо inject/extract вручную (`Propagators.DefaultTextMapPropagator`): автоинструментация покрывает HTTP, но не сообщения.
+- **Publisher confirms обязательны.** `BasicPublishAsync` без ожидания `BasicAck` — это fire-and-forget, при котором outbox пометит событие опубликованным, хотя брокер его не принял.
+- **`HttpClient` — только из `IHttpClientFactory`**, не `new` на каждую доставку.
+- **Polly — для коротких ретраев** (сеть, 5xx в рамках попытки). Долгие паузы живут в БД, а не в Polly.
+- **`System.Text.Json`**: зафиксировать `JsonSerializerOptions` (camelCase, enum как string), source generators — для контрактов.
+- **Секреты в логах**: Serilog destructuring + маскирование, иначе webhook-подпись утечёт в Loki.
 
 ---
 
@@ -916,7 +951,9 @@ JSON, обязательные поля: `ts`, `level`, `service`, `trace_id`, `
 
 ```
 .
-├── README.md
+├── PaymentsPlatform.sln
+├── Directory.Build.props        # общие настройки сборки, nullable, warnings-as-errors
+├── Directory.Packages.props     # central package management
 ├── compose.yaml
 ├── Makefile
 ├── .env.example
@@ -928,37 +965,42 @@ JSON, обязательные поля: `ts`, `level`, `service`, `trace_id`, `
 │       ├── payment.created.v1.json
 │       ├── payment.succeeded.v1.json
 │       └── ...
-├── services/
-│   ├── payments-api/
-│   │   ├── cmd/
-│   │   ├── internal/
-│   │   └── migrations/
-│   ├── processing-worker/
-│   ├── webhook-service/
-│   ├── query-api/          # этап 3
-│   └── mock-psp/
-├── pkg/                    # переиспользуемые библиотеки
-│   ├── outbox/
-│   ├── inbox/
-│   ├── idempotency/
-│   ├── backoff/
-│   ├── webhooksign/
-│   ├── observability/
-│   └── kafka/
+├── src/
+│   ├── Payments.Api/            # Minimal API, идемпотентность, state machine
+│   │   ├── Endpoints/
+│   │   ├── Domain/
+│   │   ├── Data/
+│   │   └── Migrations/
+│   ├── Payments.Worker/         # consumer, вызов PSP, retry
+│   ├── Webhooks.Api/            # подписки, доставка, история, replay
+│   ├── Query.Api/               # этап 4
+│   ├── MockPsp/
+│   ├── Payments.Contracts/      # DTO и события, без логики
+│   └── Shared/
+│       ├── Shared.Outbox/
+│       ├── Shared.Inbox/
+│       ├── Shared.Idempotency/
+│       ├── Shared.Backoff/
+│       ├── Shared.WebhookSigning/
+│       ├── Shared.Observability/
+│       └── Shared.Messaging/
 ├── deploy/
 │   ├── grafana/
 │   ├── prometheus/
 │   ├── otel/
-│   └── redpanda/
+│   └── rabbitmq/
 ├── scripts/
 │   ├── seed.sh
 │   └── demo.sh
 └── tests/
+    ├── Payments.UnitTests/
+    ├── Payments.IntegrationTests/
+    ├── Webhooks.IntegrationTests/
     ├── e2e/
     └── load/
 ```
 
-Правила: `internal/` — приватный код сервиса, `pkg/` — только то, что реально переиспользуется. Общий код — тонкий, иначе получится распределённый монолит на библиотеках.
+Правила: сервисы ссылаются только на `Payments.Contracts` и `Shared.*`, но не друг на друга. `Shared.*` — тонкие библиотеки без бизнес-логики, иначе получится распределённый монолит на общих классах. Внутри проектов — `internal`-классы по умолчанию, `public` только там, где это реально контракт.
 
 ---
 
@@ -966,16 +1008,29 @@ JSON, обязательные поля: `ts`, `level`, `service`, `trace_id`, `
 
 ```bash
 cp .env.example .env
+
+# весь стенд
 docker compose up -d --build
-./scripts/seed.sh          # мерчант, API-ключ, webhook-подписка
-open http://localhost:8080/docs        # Swagger UI
-open http://localhost:8081             # Redpanda Console
-open http://localhost:3000             # Grafana
+./scripts/seed.sh                      # мерчант, API-ключ, webhook-подписка
+
+# локальная разработка
+dotnet build
+dotnet test
+dotnet run --project src/Payments.Api
+dotnet run --project src/Payments.Worker
+
+# миграции
+dotnet ef migrations add Initial --project src/Payments.Api
+dotnet ef database update --project src/Payments.Api
+
+open http://localhost:8080/swagger      # Swagger UI
+open http://localhost:15672             # RabbitMQ Management (guest/guest)
+open http://localhost:3000              # Grafana
 ```
 
 Compose поднимает:
 
-`postgres`, `redis`, `redpanda`, `redpanda-console`, `otel-collector`, `prometheus`, `tempo`, `loki`, `grafana`, `payments-api`, `processing-worker`, `webhook-service`, `mock-psp`, `webhook-sink` (эндпоинт-приёмник для демо, умеет падать по команде).
+`postgres`, `redis`, `rabbitmq` (management), `otel-collector`, `prometheus`, `tempo`, `loki`, `grafana`, `payments-api`, `processing-worker`, `webhooks-api`, `mock-psp`, `webhook-sink` (эндпоинт-приёмник для демо, умеет падать по команде).
 
 Демо-сценарий:
 
@@ -997,8 +1052,8 @@ curl -X POST localhost:8080/v1/payments \
 
 ### 18.1. Уровни
 
-- **Unit**: state machine, расчёт backoff, канонизация body, HMAC.
-- **Integration**: testcontainers с Postgres/Redis/Redpanda; outbox relay, inbox dedupe.
+- **Unit** (xUnit): state machine, расчёт backoff через `TimeProvider`, канонизация body, HMAC.
+- **Integration** (Testcontainers for .NET + `WebApplicationFactory`): Postgres/Redis/RabbitMQ; outbox relay, inbox dedupe, publisher confirms.
 - **Contract**: валидация ответов по OpenAPI, событий по JSON Schema.
 - **E2E**: compose, полный путь create → PSP → webhook.
 - **Load**: k6, 100 rps, проверка p99 и отсутствия дублей.
@@ -1012,9 +1067,9 @@ curl -X POST localhost:8080/v1/payments \
 | 3 | 10 параллельных запросов с одним ключом | один платёж, остальные `409`/тот же ответ |
 | 4 | PSP ответил таймаутом, но списал | ретрай не создаёт второе списание (PSP idempotency) |
 | 5 | Worker упал после коммита, до публикации | событие публикуется после рестарта |
-| 6 | Redpanda недоступна 2 минуты | outbox копится, затем разгребается, лаг виден на дашборде |
+| 6 | RabbitMQ недоступна 2 минуты | outbox копится, затем разгребается, queue depth виден на дашборде |
 | 7 | Redis недоступен | сервис работает, идемпотентность через Postgres |
-| 8 | Дубликат сообщения из Kafka | inbox не даёт обработать дважды |
+| 8 | Дубликат сообщения из RabbitMQ (redelivery после nack) | inbox не даёт обработать дважды |
 | 9 | Webhook вернул 500 | ретраи по расписанию, история попыток полная |
 | 10 | Webhook недоступен 31 час | `exhausted` + DLQ + алерт, replay работает |
 | 11 | Мерчант вернул 429 с `Retry-After` | задержка не меньше указанной |
@@ -1054,7 +1109,8 @@ curl -X POST localhost:8080/v1/payments \
 | «Exactly-once» | честно: at-least-once + идемпотентность = effectively-once |
 | Общая БД у api и worker | осознанно, чтобы не строить распределённые транзакции; границы домена соблюдены |
 | Ретраи создают нагрузку | jitter, circuit breaker, лимит параллелизма, `Retry-After` |
-| Порядок событий | гарантирован по `payment_id` через ключ партиции; между платежами — нет |
+| Порядок событий | не гарантируется: RabbitMQ без партиций; события несут `aggregate_version`, потребитель идемпотентен |
+| Replay событий | RabbitMQ не хранит историю после ack; источник истины — `payment_events` и `outbox`, а не брокер |
 | Рост outbox | retention + мониторинг лага + алерт |
 | Eventual consistency read-модели | явно документируем, отдаём `as_of` / `stale` флаг |
 | Секреты в webhook | шифрование at rest, маскирование в логах, ротация |
@@ -1064,13 +1120,14 @@ curl -X POST localhost:8080/v1/payments \
 
 ## 21. Открытые вопросы
 
-1. **Язык и стек** — Go (базовый вариант) или Java/Kotlin под конкретную вакансию?
-2. **PSP** — только mock или ещё интеграция с тестовым контуром реального провайдера?
-3. **Аутентификация** — API-ключи или JWT/OAuth2 client credentials?
-4. **Мультивалютность** — фиксируем USD/EUR или нужна модель с курсами?
-5. **Refund** — закладываем в v1 или v2?
-6. **Деплой** — только compose или сразу k3s/Helm как отдельная ветка обучения?
-7. **UI** — нужен ли минимальный дашборд мерчанта или хватит Swagger + Grafana?
+1. **Версия .NET** — 8 LTS (если так на работе) или 10 LTS для проекта?
+2. **Outbox руками или через MassTransit/Wolverine** — делаем механику сами ради обучения или берём готовую библиотеку?
+3. **PSP** — только mock или ещё интеграция с тестовым контуром реального провайдера?
+4. **Аутентификация** — API-ключи или JWT/OAuth2 client credentials?
+5. **Мультивалютность** — фиксируем USD/EUR или нужна модель с курсами?
+6. **Refund** — закладываем в v1 или v2?
+7. **Деплой** — только compose или сразу k3s/Helm как отдельная ветка обучения?
+8. **UI** — нужен ли минимальный дашборд мерчанта или хватит Swagger + Grafana?
 
 ---
 
@@ -1081,6 +1138,12 @@ curl -X POST localhost:8080/v1/payments \
 
 **Почему `SKIP LOCKED`**
 Позволяет нескольким relay/worker'ам разбирать очередь без блокировок и без дублей — конкуренция на строках вместо распределённого лока.
+
+**Почему RabbitMQ, а не Kafka**
+Kafka/Redpanda сильны там, где нужны партиции, retention на дни и replay истории. В этом сервисе брокер — только транспорт: ретраи живут в БД, история — в `payment_events`, строгий порядок не нужен. RabbitMQ даёт quorum-очереди, DLX, publisher confirms и management UI при заметно меньшем потреблении памяти и без отдельного Kafka-контура. Если проект вырастет до event sourcing с replay — Kafka вернётся.
+
+**Почему не NATS JetStream и не Redis Streams**
+NATS ещё легче, но DLQ и подтверждения consumer'а придётся строить руками, а .NET-примеров меньше. Redis Streams соблазняют «ноль новых контейнеров», но превращают кэш в место хранения денежных событий — граница ответственности размывается. Для учебного проекта важнее предсказуемость и документация, чем минус 100 МБ RAM.
 
 **Почему backoff с джиттером**
 Без джиттера все ретраи приходят одновременно и добивают уже лежащий сервис. Джиттер размазывает нагрузку.
